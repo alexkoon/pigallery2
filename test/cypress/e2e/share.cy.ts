@@ -90,6 +90,94 @@ describe('Share', () => {
   });
 
 
+  /**
+   * BUG 1 — toLogin() deadlock: visiting a password-protected share URL directly
+   * while not logged in shows a blank screen instead of the share login page.
+   *
+   * Root cause: navigation.service.ts toLogin() awaits firstValueFrom(currentSharing),
+   * which never emits before authentication — so the redirect to /shareLogin never fires.
+   *
+   * This test FAILS with current code and should PASS after the fix.
+   */
+  it('Bug 1: visiting password-protected share URL directly shows login prompt, not blank screen', () => {
+    cy.wait('@getContent');
+
+    cy.get('button#shareButton').click();
+    cy.get('input#share-password').type('secret', {force: true});
+    cy.get('button#getShareButton').click();
+
+    cy.get('input#shareLink').should('contain.value', 'http');
+    cy.get('input#shareLink')
+      .invoke('val')
+      .then((link: string) => {
+        cy.get('button.btn-close').click();
+        cy.get('button#button-frame-menu').click();
+        cy.get('#dropdown-frame-menu  ng-icon[name="ionLogOutOutline"]').click({scrollBehavior: false});
+
+        const url = new URL(link);
+        const sk = url.pathname.split('/').pop();
+
+        // Visit the direct share URL (as a recipient would) — NOT /shareLogin explicitly.
+        // This is what triggers the toLogin() deadlock in the current code.
+        cy.visit('/share/' + sk);
+
+        // Should be redirected to the share login page, not stuck on a blank screen.
+        // With the bug: URL stays at /share/<key> and nothing renders.
+        cy.url({timeout: 5000}).should('include', 'shareLogin');
+        cy.get('input#password', {timeout: 5000}).should('be.visible');
+      });
+  });
+
+  /**
+   * BUG 2 — 401 infinite loop: after visiting a password-protected share while logged
+   * out, repeated 401 responses cause error.interceptor → logout() → getSessionUser()
+   * → 401 → logout() → … to cycle indefinitely.
+   *
+   * Root cause: authentication.service.ts logout() unconditionally calls getSessionUser()
+   * when isSharing() is true, even when the user is already unauthenticated.
+   *
+   * This test FAILS with current code and should PASS after the fix.
+   */
+  it('Bug 2: visiting password-protected share URL does not cause a /user/me request loop', () => {
+    cy.wait('@getContent');
+
+    cy.get('button#shareButton').click();
+    cy.get('input#share-password').type('secret', {force: true});
+    cy.get('button#getShareButton').click();
+
+    cy.get('input#shareLink').should('contain.value', 'http');
+    cy.get('input#shareLink')
+      .invoke('val')
+      .then((link: string) => {
+        cy.get('button.btn-close').click();
+        cy.get('button#button-frame-menu').click();
+        cy.get('#dropdown-frame-menu  ng-icon[name="ionLogOutOutline"]').click({scrollBehavior: false});
+
+        const url = new URL(link);
+        const sk = url.pathname.split('/').pop();
+
+        let userMeCallCount = 0;
+        cy.intercept('/pgapi/user/me*', (req) => {
+          userMeCallCount++;
+          req.continue();
+        }).as('userMe');
+
+        cy.visit('/share/' + sk);
+
+        // Allow time for any potential loop to accumulate requests.
+        // A healthy flow makes at most one or two /user/me calls.
+        // The loop typically fires dozens of times per second.
+        // eslint-disable-next-line cypress/no-unnecessary-waiting
+        cy.wait(2000);
+
+        cy.wrap(null).then(() => {
+          // With the bug: userMeCallCount climbs into the dozens or hundreds.
+          // After the fix: at most a handful of calls.
+          expect(userMeCallCount).to.be.lessThan(5);
+        });
+      });
+  });
+
   it('Open no password sharing', () => {
     cy.wait('@getContent');
 

@@ -14,6 +14,10 @@ class MockUserService {
     return Promise.resolve({name: 'testUserName'} as UserDTO);
   }
 
+  public async logout(): Promise<string> {
+    return null;
+  }
+
   public async getSessionUser(): Promise<UserDTO> {
     return null;
   }
@@ -26,12 +30,22 @@ class MockNetworkService {
 }
 
 class MockShareService {
+  sharingKey: string = null;
+
   onNewUser(user: any): void {
     // mock fn
   }
 
   wait(): Promise<void> {
     return Promise.resolve();
+  }
+
+  isSharing(): boolean {
+    return this.sharingKey != null;
+  }
+
+  getSharingKey(): string {
+    return this.sharingKey;
   }
 }
 
@@ -89,4 +103,68 @@ describe('AuthenticationService', () => {
         });
         authService.login({} as any);
       })());
+
+  /**
+   * BUG 2 — 401 infinite loop for password-protected shares.
+   *
+   * When a 401 response arrives while the user is in a sharing session:
+   *   error.interceptor.ts  → calls authenticationService.logout()
+   *   authentication.service.ts logout() → calls getSessionUser() when isSharing()
+   *   getSessionUser() → GET /user/me?sk=<key> → 401 → interceptor fires → logout() → …
+   *
+   * The loop repeats until the browser tab is killed or the stack overflows.
+   *
+   * The root issue in AuthenticationService: logout() should NOT call getSessionUser()
+   * when the user is already unauthenticated (i.e. after clearing this.user to null),
+   * because that call can itself trigger another 401 and restart the cycle.
+   *
+   * These tests FAIL with the current code and should PASS after the fix.
+   */
+  describe('Bug 2 – logout() triggers getSessionUser() during sharing, enabling 401 loop', () => {
+    it('should not call getSessionUser() after logging out when sharing is active',
+      inject(
+        [AuthenticationService, UserService, ShareService],
+        async (authService: AuthenticationService, userService: UserService, shareService: MockShareService) => {
+          shareService.sharingKey = 'testkey123';
+
+          spyOn(userService, 'getSessionUser').and.returnValue(Promise.resolve(null));
+
+          await authService.logout();
+
+          // BUG: with current code getSessionUser IS called here.
+          // This creates the loop: the HTTP call can return 401, which fires the
+          // error interceptor, which calls logout() again, which calls
+          // getSessionUser() again, indefinitely.
+          expect(userService.getSessionUser).not.toHaveBeenCalled();
+        }
+      )
+    );
+
+    it('should not call getSessionUser() on each successive logout() call when sharing',
+      inject(
+        [AuthenticationService, UserService, ShareService],
+        async (authService: AuthenticationService, userService: UserService, shareService: MockShareService) => {
+          shareService.sharingKey = 'testkey123';
+
+          let callCount = 0;
+          spyOn(userService, 'getSessionUser').and.callFake(() => {
+            callCount++;
+            return Promise.resolve(null);
+          });
+
+          // Each logout() call independently triggers getSessionUser() when sharing is
+          // active. This proves the mechanism: every external trigger of logout()
+          // (such as the error interceptor firing on a 401) adds another getSessionUser()
+          // call, each of which can itself produce a 401 that re-triggers the interceptor.
+          await authService.logout();
+          await authService.logout();
+          await authService.logout();
+
+          // After the fix: 0 calls (logout should not trigger getSessionUser).
+          // With the bug: 3 calls — one per logout() invocation.
+          expect(callCount).toBe(0);
+        }
+      )
+    );
+  });
 });
