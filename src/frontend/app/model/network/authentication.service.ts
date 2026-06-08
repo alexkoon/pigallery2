@@ -99,11 +99,6 @@ export class AuthenticationService {
   public async logout(): Promise<void> {
     await this.userService.logout();
     this.user.next(null);
-    // even on logout try to get sharing user if it's a sharing
-    await this.shareService.wait();
-    if(this.shareService.isSharing()){
-      await this.getSessionUser();
-    }
   }
 
   private async getSessionUser(): Promise<void> {
